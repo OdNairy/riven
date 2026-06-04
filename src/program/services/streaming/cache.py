@@ -274,6 +274,8 @@ class Cache:
             logger.warning(f"Failed to remove cache metadata for {key}: {e}")
 
     async def _evict_lru(self, need_bytes: int = 0) -> None:
+        to_delete: list[tuple[str, Path]] = []
+
         async with self.locks():
             target = max(0, self._total_bytes + need_bytes - self.cfg.max_size_bytes)
 
@@ -292,25 +294,24 @@ class Cache:
                     if not lst:
                         self._by_path.pop(cache_entry.cache_key, None)
 
-                fp = self._file_for(k)
-
-                try:
-                    if fp.exists():
-                        fp.unlink()
-
-                    # Also remove metadata file
-                    self._remove_metadata(k)
-                except Exception:
-                    pass
-
+                to_delete.append((k, self._file_for(k)))
                 self._total_bytes -= cache_entry.size
                 target -= cache_entry.size
                 self._metrics.evictions += 1
 
+        # File I/O outside the lock to avoid blocking concurrent reads
+        for k, fp in to_delete:
+            try:
+                if fp.exists():
+                    fp.unlink()
+                self._remove_metadata(k)
+            except Exception:
+                pass
+
     async def _evict_ttl(self) -> None:
         ttl = self.cfg.ttl_seconds
         now = time.time()
-        removed = 0
+        to_delete: list[tuple[str, Path]] = []
 
         async with self.locks():
             for k in list(self._index.keys()):
@@ -320,17 +321,6 @@ class Cache:
                     continue
 
                 if now - cache_entry.mtime > ttl:
-                    fp = self._file_for(k)
-
-                    try:
-                        if fp.exists():
-                            fp.unlink()
-
-                        # Also remove metadata file
-                        self._remove_metadata(k)
-                    except Exception:
-                        pass
-
                     self._index.pop(k, None)
                     lst = self._by_path.get(cache_entry.cache_key)
 
@@ -344,10 +334,19 @@ class Cache:
                             self._by_path.pop(cache_entry.cache_key, None)
 
                     self._total_bytes -= cache_entry.size
-                    removed += 1
+                    to_delete.append((k, self._file_for(k)))
 
-        if removed:
-            self._metrics.evictions += removed
+        # File I/O outside the lock to avoid blocking concurrent reads
+        for k, fp in to_delete:
+            try:
+                if fp.exists():
+                    fp.unlink()
+                self._remove_metadata(k)
+            except Exception:
+                pass
+
+        if to_delete:
+            self._metrics.evictions += len(to_delete)
 
     async def get(self, cache_key: str, start: int, end: int) -> bytes:
         needed_len = max(0, end - start + 1)
@@ -363,7 +362,9 @@ class Cache:
         chunk_file = None
         chunk_start_offset = 0
 
-        async with self.locks():
+        _lock1_wait_start = time.time()
+        with self._thread_lock:
+            _lock1_wait = time.time() - _lock1_wait_start
             s_list = self._by_path.get(cache_key)
 
             if s_list:
@@ -409,9 +410,11 @@ class Cache:
                     )
 
                 if len(result) == needed_len:
-                    # Update LRU (move to end) but only update timestamp periodically
-                    # to reduce lock contention and index modifications
-                    async with self.locks():
+                    # Update LRU synchronously — no trio checkpoint, no scheduler overhead
+                    _lock2_wait_start = time.time()
+                    _lock2_wait = 0.0
+                    with self._thread_lock:
+                        _lock2_wait = time.time() - _lock2_wait_start
                         if chunk_key in self._index:
                             cache_entry = self._index[chunk_key]
                             self._index.move_to_end(chunk_key, last=True)
@@ -436,7 +439,7 @@ class Cache:
 
                     if total_time > 0.1:  # Log if cache.get() takes >100ms
                         logger.warning(
-                            f"Slow cache.get(): {total_time * 1000:.0f}ms for {needed_len / (1024 * 1024):.2f}MB (read: {read_time * 1000:.0f}ms)"
+                            f"Slow cache.get(): {total_time * 1000:.0f}ms for {needed_len / (1024 * 1024):.2f}MB (read: {read_time * 1000:.0f}ms, lock1_wait: {_lock1_wait * 1000:.0f}ms, lock2_wait: {_lock2_wait * 1000:.0f}ms)"
                         )
 
                     return result
