@@ -355,6 +355,8 @@ class Cache:
             return b""
 
         get_start_time = time.time()
+        _p0 = time.perf_counter()
+        _t0 = time.thread_time()
 
         # Fast path: Try to find a single chunk that contains the entire request
         # This avoids holding the lock during file I/O for the common case
@@ -365,6 +367,7 @@ class Cache:
         _lock1_wait_start = time.time()
         with self._thread_lock:
             _lock1_wait = time.time() - _lock1_wait_start
+            _p1 = time.perf_counter()
             s_list = self._by_path.get(cache_key)
 
             if s_list:
@@ -390,6 +393,7 @@ class Cache:
         if chunk_key and chunk_file:
             try:
                 read_start = time.time()
+                _p2 = time.perf_counter()
 
                 # Calculate slice within chunk
                 copy_start = start - chunk_start_offset
@@ -403,6 +407,7 @@ class Cache:
                     result = f.read(bytes_to_read)
 
                 read_time = time.time() - read_start
+                _p3 = time.perf_counter()
 
                 if read_time > 0.05:  # Log slow reads (>50ms)
                     logger.warning(
@@ -415,6 +420,7 @@ class Cache:
                     _lock2_wait = 0.0
                     with self._thread_lock:
                         _lock2_wait = time.time() - _lock2_wait_start
+                        _p4 = time.perf_counter()
                         if chunk_key in self._index:
                             cache_entry = self._index[chunk_key]
                             self._index.move_to_end(chunk_key, last=True)
@@ -436,10 +442,15 @@ class Cache:
                     self._metrics.bytes_from_cache += needed_len
 
                     total_time = time.time() - get_start_time
+                    _p5 = time.perf_counter()
+                    _thread_total = time.thread_time() - _t0
 
                     if total_time > 0.1:  # Log if cache.get() takes >100ms
                         logger.warning(
-                            f"Slow cache.get(): {total_time * 1000:.0f}ms for {needed_len / (1024 * 1024):.2f}MB (read: {read_time * 1000:.0f}ms, lock1_wait: {_lock1_wait * 1000:.0f}ms, lock2_wait: {_lock2_wait * 1000:.0f}ms)"
+                            f"Slow cache.get(): wall={total_time*1000:.0f}ms thread_cpu={_thread_total*1000:.1f}ms for {needed_len/(1024*1024):.2f}MB | "
+                            f"G1(start->lock1)={(_p1-_p0)*1000:.0f}ms G2_3(lock1->read)={(_p2-_p1)*1000:.0f}ms read={(_p3-_p2)*1000:.0f}ms "
+                            f"G4(read->lock2)={(_p4-_p3)*1000:.0f}ms G6(lock2->end)={(_p5-_p4)*1000:.0f}ms | "
+                            f"lock1_wait={_lock1_wait*1000:.0f}ms lock2_wait={_lock2_wait*1000:.0f}ms"
                         )
 
                     return result

@@ -1688,7 +1688,16 @@ class RivenVFS(pyfuse3.Operations):
                 try:
                     logger.trace(f"Validating CDN URL for {node.path}...")
 
-                    DebridCDNUrl.from_filename(node.original_filename).validate()
+                    # Fix 1: the validate() path makes a synchronous DB query and a
+                    # blocking httpx GET. Run it in a worker thread so it does not
+                    # freeze the trio event loop (head-of-line blocking that stalls
+                    # all other FUSE reads, e.g. an active stream, while a storm of
+                    # opens validates links).
+                    await trio.to_thread.run_sync(
+                        lambda: DebridCDNUrl.from_filename(
+                            node.original_filename
+                        ).validate()
+                    )
                 except DebridServiceLinkUnavailable:
                     logger.warning(
                         f"Dead link for {node.path}; attempting to download a working one..."

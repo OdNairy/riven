@@ -1,4 +1,5 @@
 from typing import Self
+import time
 import httpx
 from loguru import logger
 
@@ -12,6 +13,14 @@ from program.services.streaming.exceptions import (
 )
 from program.media.media_entry import MediaEntry
 from program.db.db import db_session
+
+
+# Fix 3: cache successful CDN-URL validations for a short window so repeated
+# open() calls for the same file don't each issue a blocking HTTP GET.
+# Prevents a storm of validations when a player opens many files (BIF/intro
+# detection, library scans).
+_VALIDATION_TTL_SECONDS = 300.0
+_validation_cache: dict[str, float] = {}  # url -> monotonic expiry timestamp
 
 
 class RefreshedURLIdenticalException(Exception):
@@ -74,9 +83,19 @@ class DebridCDNUrl:
                     else:
                         return None
 
+                # Fix 3: skip the network round-trip if this URL was validated
+                # successfully within the TTL window.
+                cached_expiry = _validation_cache.get(self.url)
+                if cached_expiry is not None and cached_expiry > time.monotonic():
+                    return self.url
+
                 with httpx.Client(proxy=proxy) as client:
                     with client.stream(method="GET", url=self.url) as response:
                         response.raise_for_status()
+
+                        _validation_cache[self.url] = (
+                            time.monotonic() + _VALIDATION_TTL_SECONDS
+                        )
 
                         return self.url
             except httpx.TimeoutException as e:
