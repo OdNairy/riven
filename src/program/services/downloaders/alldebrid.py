@@ -609,14 +609,13 @@ class AllDebridDownloader(DownloaderBase):
                     all_files = list[AllDebridFile]()
 
                     for file_or_directory in files:
-                        download_link = ""
-
                         if isinstance(file_or_directory, AllDebridFile):
-                            download_link = file_or_directory.l
+                            # Top-level file (e.g. single-file torrent) — add directly
+                            all_files.append(file_or_directory)
                         else:
-                            # Recursively process files/folders and add download link
+                            # Directory — recurse into entries
                             self._add_link_to_files_recursive(
-                                file_or_directory.e, download_link, all_files
+                                file_or_directory.e, "", all_files
                             )
 
                     if all_files:
