@@ -972,7 +972,7 @@ def _download_and_update(
 
         assert scraping_session.torrent_id is not None
         info = debrid_service.get_torrent_info(scraping_session.torrent_id)
-        if not info or not info.files:
+        if not info:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to retrieve torrent info — torrent may have expired",
@@ -982,26 +982,35 @@ def _download_and_update(
         file_id_set = set(file_ids)
         container_files = list[DebridFile]()
 
-        for fid, meta in info.files.items():
-            if fid not in file_id_set:
-                continue
-            if not meta.download_url:
-                logger.warning(
-                    f"No download URL for file {fid} ({meta.filename}), skipping"
-                )
-                continue
-            try:
-                df = DebridFile.create(
-                    path=meta.path,
-                    filename=meta.filename,
-                    filesize_bytes=meta.bytes,
-                    filetype=item_type,
-                    file_id=fid,
-                )
-                df.download_url = meta.download_url
-                container_files.append(df)
-            except Exception as e:
-                logger.warning(f"Skipping file {meta.filename}: {e}")
+        if info.files:
+            # Standard path (RealDebrid, DebridLink): info.files keyed by integer file ID
+            for fid, meta in info.files.items():
+                if fid not in file_id_set:
+                    continue
+                if not meta.download_url:
+                    logger.warning(
+                        f"No download URL for file {fid} ({meta.filename}), skipping"
+                    )
+                    continue
+                try:
+                    df = DebridFile.create(
+                        path=meta.path,
+                        filename=meta.filename,
+                        filesize_bytes=meta.bytes,
+                        filetype=item_type,
+                        file_id=fid,
+                    )
+                    df.download_url = meta.download_url
+                    container_files.append(df)
+                except Exception as e:
+                    logger.warning(f"Skipping file {meta.filename}: {e}")
+        else:
+            # Fallback for AllDebrid: get_torrent_info() always returns files={} because
+            # AllDebrid has no per-file IDs. Use the container stored during session setup,
+            # which was populated by _extract_files_recursive with sequential synthetic IDs.
+            stored = scraping_session.containers
+            if stored and stored.files:
+                container_files = [f for f in stored.files if f.file_id in file_id_set]
 
         if not container_files:
             raise HTTPException(
