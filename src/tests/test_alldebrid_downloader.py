@@ -180,8 +180,8 @@ def test_download_and_update_standard_path_unchanged_for_realdebrid():
     from program.services.downloaders.models import TorrentFile
 
     files_map = {
-        1: TorrentFile(id=1, path="/ep01.mkv", filename="ep01.mkv", bytes=500_000_000, selected=True),
-        2: TorrentFile(id=2, path="/ep02.mkv", filename="ep02.mkv", bytes=500_000_000, selected=True),
+        1: TorrentFile(id=1, path="/ep01.mkv", bytes=500_000_000, selected=1, download_url="https://rd.com/f/1"),
+        2: TorrentFile(id=2, path="/ep02.mkv", bytes=500_000_000, selected=1, download_url="https://rd.com/f/2"),
     }
     info = TorrentInfo(
         id=456,
@@ -202,17 +202,9 @@ def test_download_and_update_standard_path_unchanged_for_realdebrid():
         for fid, meta in info.files.items():
             if fid not in file_id_set:
                 continue
-            try:
-                df = DebridFile.create(
-                    path=meta.path,
-                    filename=meta.filename,
-                    filesize_bytes=meta.bytes,
-                    filetype="movie",
-                    file_id=fid,
-                )
-                container_files.append(df)
-            except Exception:
-                pass
+            df = DebridFile(file_id=fid, filename=meta.filename, filesize=meta.bytes)
+            df.download_url = meta.download_url
+            container_files.append(df)
 
     assert len(container_files) == 1
     assert container_files[0].file_id == 1
