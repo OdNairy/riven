@@ -112,7 +112,7 @@ class AllDebridMagnetStatusResponse(BaseModel):
         status_code: int = Field(alias="statusCode")
         upload_date: int = Field(alias="uploadDate")
         completion_date: int = Field(alias="completionDate")
-        files: list[AllDebridFile | AllDebridDirectory] | None
+        files: list[AllDebridFile | AllDebridDirectory] | None = None
 
     class MagnetErrorInfo(BaseModel):
         id: str
@@ -458,16 +458,10 @@ class AllDebridDownloader(DownloaderBase):
         files: list[DebridFile],
         infohash: str,
         path_prefix: str = "",
+        _id_counter: list[int] | None = None,
     ) -> None:
-        """
-        Recursively extract files from AllDebrid's nested file structure.
-
-        AllDebrid returns files with:
-        - 'n' (name): filename or folder name
-        - 's' (size): file size in bytes (only for files, not folders)
-        - 'l' (link): download link (only for files, not folders)
-        - 'e' (entries): array of nested files/folders (only for folders)
-        """
+        if _id_counter is None:
+            _id_counter = [0]
 
         for file_entry in file_list:
             name = file_entry.n
@@ -485,11 +479,12 @@ class AllDebridDownloader(DownloaderBase):
                     filename=name,
                     filesize_bytes=size,
                     filetype=item_type,
-                    file_id=None,
+                    file_id=_id_counter[0],
                 )
 
                 df.download_url = link
                 files.append(df)
+                _id_counter[0] += 1
             except InvalidDebridFileException:
                 pass
 
