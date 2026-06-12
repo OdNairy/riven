@@ -2,6 +2,8 @@ import trio
 import trio_util
 import pyfuse3
 import httpx
+import socket as _socket_module
+import struct
 
 from functools import cached_property
 from contextlib import asynccontextmanager
@@ -541,7 +543,35 @@ class MediaStream:
                     ),
                 )
 
-            yield stream_connection
+            try:
+                yield stream_connection
+            finally:
+                if self.is_killed.value:
+                    self._force_rst(response)
+
+    def _force_rst(self, response: httpx.Response) -> None:
+        """Set SO_LINGER=(1,0) so the kernel sends TCP RST instead of FIN.
+
+        Without this, closing a connection with unread Recv-Q data leaves
+        a zombie socket until the server finishes streaming (hours). RST
+        immediately frees the kernel tcp_mem pages.
+        """
+        try:
+            network_stream = response.extensions.get("network_stream")
+            if network_stream is None:
+                return
+            sock = network_stream.get_extra_info("socket")
+            if sock is None:
+                return
+            sock.setsockopt(
+                _socket_module.SOL_SOCKET,
+                _socket_module.SO_LINGER,
+                struct.pack("ii", 1, 0),
+            )
+            if self.enable_tracing:
+                logger.log("STREAM", self.build_log_message("Applied SO_LINGER RST to connection socket"))
+        except Exception as e:
+            logger.warning(self.build_log_message(f"Failed to apply SO_LINGER: {e}"))
 
     async def close(self) -> None:
         """Immediately terminate the active stream."""
