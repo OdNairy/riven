@@ -1,0 +1,39 @@
+{
+    "status": "success",
+    "data": {
+        "magnets": {
+            "id": 580715671,
+            "filename": "Test Show",
+            "size": 314572800,
+            "hash": "3d71e2e62176e2c7e51c6a6938063459bdbca3a4",
+            "status": "Ready",
+            "statusCode": 4,
+            "uploadDate": 1781106237,
+            "completionDate": 1781106237,
+            "type": "m",
+            "notified": false,
+            "version": 2,
+            "files": [
+                {
+                    "n": "Test Show",
+                    "e": [
+                        {
+                            "n": "1",
+                            "e": [
+                                {"n": "01 - Episode One.avi", "s": 104857600, "l": "https://alldebrid.com/f/link1"},
+                                {"n": "02 - Episode Two.avi", "s": 104857600, "l": "https://alldebrid.com/f/link2"}
+                            ]
+                        },
+                        {
+                            "n": "2",
+                            "e": [
+                                {"n": "03 - Episode Three.avi", "s": 104857600, "l": "https://alldebrid.com/f/link3"}
+                            ]
+                        },
+                        {"n": "cover.jpg", "s": 12288, "l": "https://alldebrid.com/f/cover"}
+                    ]
+                }
+            ]
+        }
+    }
+}

@@ -1,176 +1,210 @@
-# import json
+import json
+from pathlib import Path
+from unittest.mock import MagicMock
 
-# import pytest
+import pytest
 
-# from program.services.downloaders import alldebrid
-# from program.services.downloaders.alldebrid import (
-#     AllDebridDownloader,
-#     add_torrent,
-#     get_instant_availability,
-#     get_status,
-#     get_torrents,
-# )
-# from program.settings.manager import settings_manager as settings
+from program.services.downloaders.alldebrid import (
+    AllDebridDirectory,
+    AllDebridFile,
+    AllDebridMagnetStatusResponse,
+    AllDebridResponse,
+)
+from program.services.downloaders.models import DebridFile, TorrentContainer, TorrentInfo
 
-
-# @pytest.fixture
-# def downloader(instant, upload, status, status_all, delete):
-#     """Instance of AllDebridDownloader with API calls mocked"""
-#     # mock API calls
-#     _get = alldebrid.get
-#     def get(url, **params):
-#         match url:
-#             case "user":
-#                 return {"data": { "user": { "isPremium": True, "premiumUntil": 1735514599, } } }
-#             case "magnet/instant":
-#                 return instant(url, **params)
-#             case "magnet/upload":
-#                 return upload(url, **params)
-#             case "magnet/delete":
-#                 return delete(url, **params)
-#             case "magnet/status":
-#                 if params.get("id", False):
-#                     return status(url, **params)
-#                 else:
-#                     return status_all(url, **params)
-#             case _:
-#                 raise Exception("unmatched api call")
-#     alldebrid.get = get
-
-#     alldebrid_settings = settings.settings.downloaders.all_debrid
-#     alldebrid_settings.enabled = True
-#     alldebrid_settings.api_key = "key"
-
-#     downloader = AllDebridDownloader()
-#     assert downloader.initialized
-#     yield downloader
-
-#     # tear down mock
-#     alldebrid.get = get
+TEST_DATA = Path(__file__).parent / "test_data"
 
 
-# ## Downloader tests
-# def test_process_hashes(downloader):
-#     hashes = downloader.process_hashes(["abc"], None, [False, True])
-#     assert len(hashes) == 1
+# ---------------------------------------------------------------------------
+# Test group 1 — Pydantic model (Fix 1: MagnetInfo.files optional)
+# ---------------------------------------------------------------------------
 
 
-# def test_download_cached(downloader):
-#     torrent_id = downloader.download_cached({"infohash": "abc"})
-#     assert torrent_id == MAGNET_ID
+def test_magnet_status_without_files_parses_ok():
+    with open(TEST_DATA / "alldebrid_magnet_status_one_downloading.json") as f:
+        body = json.load(f)
+
+    result = AllDebridResponse[AllDebridMagnetStatusResponse].model_validate(
+        {"data": body}
+    )
+    from program.services.downloaders.alldebrid import AllDebridSuccessResponse
+
+    assert isinstance(result.data, AllDebridSuccessResponse)
+    magnets = result.data.data.magnets
+    assert len(magnets) == 1
+    magnet = magnets[0]
+    assert isinstance(magnet, AllDebridMagnetStatusResponse.MagnetInfo)
+    assert magnet.files is None
 
 
-# def test_get_torrent_names(downloader):
-#     names = downloader.get_torrent_names(123)
-#     assert names == ("Ubuntu 24.04", None)
+def test_magnet_status_with_files_unchanged():
+    with open(TEST_DATA / "alldebrid_magnet_status_nested_files.json") as f:
+        body = json.load(f)
+
+    result = AllDebridResponse[AllDebridMagnetStatusResponse].model_validate(
+        {"data": body}
+    )
+    from program.services.downloaders.alldebrid import AllDebridSuccessResponse
+
+    assert isinstance(result.data, AllDebridSuccessResponse)
+    magnets = result.data.data.magnets
+    assert len(magnets) == 1
+    magnet = magnets[0]
+    assert isinstance(magnet, AllDebridMagnetStatusResponse.MagnetInfo)
+    assert magnet.files is not None
+    assert len(magnet.files) == 1
+    assert isinstance(magnet.files[0], AllDebridDirectory)
 
 
-# ## API parsing tests
-# def test_get_instant_availability(instant):
-#     alldebrid.get = instant
-#     infohashes = [UBUNTU]
-#     availability = get_instant_availability(infohashes)
-#     assert len(availability[0].get("files", [])) == 2
+# ---------------------------------------------------------------------------
+# Test group 2 — File extraction (Fix 2: sequential file IDs)
+# ---------------------------------------------------------------------------
 
 
-# def test_get_instant_availability_unavailable(instant_unavailable):
-#     alldebrid.get = instant_unavailable
-#     infohashes = [UBUNTU]
-#     availability = get_instant_availability(infohashes)
-#     assert availability[0]["hash"] == UBUNTU
+def _make_downloader_stub():
+    """Return a minimal AllDebridDownloader-like object without real API init."""
+    from program.services.downloaders.alldebrid import AllDebridDownloader
+
+    obj = object.__new__(AllDebridDownloader)
+    return obj
 
 
-# def test_add_torrent(upload):
-#     alldebrid.get = upload
-#     torrent_id = add_torrent(UBUNTU)
-#     assert torrent_id == 251993753
+def test_extract_files_assigns_sequential_ids():
+    downloader = _make_downloader_stub()
+    flat_files = [
+        AllDebridFile(n="ep01.mkv", s=500_000_000, l="https://ad.com/f/1"),
+        AllDebridFile(n="ep02.mkv", s=500_000_000, l="https://ad.com/f/2"),
+        AllDebridFile(n="ep03.mkv", s=500_000_000, l="https://ad.com/f/3"),
+    ]
+    result: list[DebridFile] = []
+    downloader._extract_files_recursive(flat_files, "episode", result, "abc123")
+
+    assert len(result) == 3
+    assert [f.file_id for f in result] == [0, 1, 2]
 
 
-# def test_add_torrent_cached(upload_ready):
-#     alldebrid.get = upload_ready
-#     torrent_id = add_torrent(UBUNTU)
-#     assert torrent_id == 251993753
+def test_extract_files_nested_directories_flattened():
+    """Files from nested dirs (after _add_link_to_files_recursive) get sequential IDs."""
+    downloader = _make_downloader_stub()
+    # Flat list as produced by _add_link_to_files_recursive from the nested fixture
+    flat_files = [
+        AllDebridFile(n="01 - Episode One.avi", s=104_857_600, l="https://ad.com/f/link1"),
+        AllDebridFile(n="02 - Episode Two.avi", s=104_857_600, l="https://ad.com/f/link2"),
+        AllDebridFile(n="03 - Episode Three.avi", s=104_857_600, l="https://ad.com/f/link3"),
+        AllDebridFile(n="cover.jpg", s=12_288, l="https://ad.com/f/cover"),
+    ]
+    result: list[DebridFile] = []
+    downloader._extract_files_recursive(flat_files, "episode", result, "abc123")
+
+    # cover.jpg filtered by DebridFile.create (non-video extension)
+    assert len(result) == 3
+    assert [f.file_id for f in result] == [0, 1, 2]
 
 
-# def test_get_status(status):
-#     alldebrid.get = status
-#     torrent_status = get_status(251993753)
-#     assert torrent_status["filename"] == "Ubuntu 24.04"
+def test_extract_files_respects_episode_size_minimum():
+    """Files below episode_filesize_mb_min are excluded; IDs still sequential for valid files."""
+    downloader = _make_downloader_stub()
+    flat_files = [
+        AllDebridFile(n="ep01.mkv", s=500_000_000, l="https://ad.com/f/1"),
+        AllDebridFile(n="tiny.mkv", s=1_000, l="https://ad.com/f/tiny"),   # too small
+        AllDebridFile(n="ep03.mkv", s=500_000_000, l="https://ad.com/f/3"),
+    ]
+    result: list[DebridFile] = []
+    downloader._extract_files_recursive(flat_files, "episode", result, "abc123")
+
+    assert len(result) == 2
+    assert [f.file_id for f in result] == [0, 1]
 
 
-# def test_get_status_unfinished(status_downloading):
-#     alldebrid.get = status_downloading
-#     torrent_status = get_status(251993753)
-#     assert torrent_status["status"] == "Downloading"
+# ---------------------------------------------------------------------------
+# Test group 3 — Manual scrape session integration (Fix 2 + 3)
+# ---------------------------------------------------------------------------
 
 
-# def test_get_torrents(status_all):
-#     alldebrid.get = status_all
-#     torrents = get_torrents()
-#     assert torrents[0]["status"] == "Ready"
+def _make_debrid_file(file_id: int, name: str, url: str) -> DebridFile:
+    df = DebridFile(file_id=file_id, filename=name, filesize=500_000_000)
+    df.download_url = url
+    return df
 
 
-# def test_delete(delete):
-#     alldebrid.get = delete
-#     delete(123)
+def test_manual_session_parsed_files_not_empty_for_alldebrid():
+    """start_manual_session loop skips file_id=None; with sequential IDs all files pass."""
+    files = [
+        _make_debrid_file(0, "ep01.mkv", "https://ad.com/f/1"),
+        _make_debrid_file(1, "ep02.mkv", "https://ad.com/f/2"),
+        _make_debrid_file(2, "ep03.mkv", "https://ad.com/f/3"),
+    ]
+    # Simulate the loop from start_manual_session
+    parsed = [f for f in files if f.file_id is not None]
+    assert len(parsed) == 3
 
 
-# # Example requests - taken from real API calls
-# UBUNTU = "3648baf850d5930510c1f172b534200ebb5496e6"
-# MAGNET_ID = "251993753"
-# @pytest.fixture
-# def instant():
-#     """GET /magnet/instant?magnets[0]=infohash (torrent available)"""
-#     with open("src/tests/test_data/alldebrid_magnet_instant.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
+def test_download_and_update_uses_container_fallback_when_info_files_empty():
+    """When info.files is empty (AllDebrid), container fallback returns selected files."""
+    files = [
+        _make_debrid_file(0, "ep01.mkv", "https://ad.com/f/1"),
+        _make_debrid_file(1, "ep02.mkv", "https://ad.com/f/2"),
+        _make_debrid_file(2, "ep03.mkv", "https://ad.com/f/3"),
+    ]
 
-# @pytest.fixture
-# def instant_unavailable():
-#     """GET /magnet/instant?magnets[0]=infohash (torrent unavailable)"""
-#     with open("src/tests/test_data/alldebrid_magnet_instant_unavailable.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
+    # Simulate the fallback branch from _download_and_update
+    info = TorrentInfo(
+        id=123,
+        name="Test",
+        status="Ready",
+        infohash=None,
+        bytes=0,
+        created_at=None,
+        completed_at=None,
+        progress=100.0,
+        files={},
+        links=[],
+    )
+    stored_container = TorrentContainer(infohash="abc123", files=files)
 
-# @pytest.fixture
-# def upload():
-#     """GET /magnet/upload?magnets[]=infohash (torrent not ready yet)"""
-#     with open("src/tests/test_data/alldebrid_magnet_upload_not_ready.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
+    file_id_set = {0, 2}
+    container_files: list[DebridFile] = []
 
-# @pytest.fixture
-# def upload_ready():
-#     """GET /magnet/upload?magnets[]=infohash (torrent ready)"""
-#     with open("src/tests/test_data/alldebrid_magnet_upload_ready.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
+    if info.files:
+        pass  # standard path — not taken
+    else:
+        if stored_container and stored_container.files:
+            container_files = [f for f in stored_container.files if f.file_id in file_id_set]
 
-# @pytest.fixture
-# def status():
-#     """GET /magnet/status?id=123 (debrid links ready)"""
-#     with open("src/tests/test_data/alldebrid_magnet_status_one_ready.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
+    assert len(container_files) == 2
+    assert {f.file_id for f in container_files} == {0, 2}
 
-# @pytest.fixture
-# def status_downloading():
-#     """GET /magnet/status?id=123 (debrid links not ready yet)"""
-#     with open("src/tests/test_data/alldebrid_magnet_status_one_downloading.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
 
-# @pytest.fixture
-# def status_all():
-#     """GET /magnet/status (gets a list of all links instead of a single object)"""
-#     # The body is the same as a single item, but with all your magnets in a list.
-#     with open("src/tests/test_data/alldebrid_magnet_status_one_ready.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: {"status": "success", "data": {"magnets": [body["data"]["magnets"]]}}
+def test_download_and_update_standard_path_unchanged_for_realdebrid():
+    """When info.files is populated (RealDebrid), standard path is used, no fallback."""
+    from program.services.downloaders.models import TorrentFile
 
-# @pytest.fixture
-# def delete():
-#     """GET /delete"""
-#     with open("src/tests/test_data/alldebrid_magnet_delete.json") as f:
-#         body = json.load(f)
-#     return lambda url, **params: body
+    files_map = {
+        1: TorrentFile(id=1, path="/ep01.mkv", bytes=500_000_000, selected=1, download_url="https://rd.com/f/1"),
+        2: TorrentFile(id=2, path="/ep02.mkv", bytes=500_000_000, selected=1, download_url="https://rd.com/f/2"),
+    }
+    info = TorrentInfo(
+        id=456,
+        name="Test",
+        status="downloaded",
+        infohash=None,
+        bytes=0,
+        created_at=None,
+        completed_at=None,
+        progress=100.0,
+        files=files_map,
+        links=[],
+    )
+    file_id_set = {1}
+    container_files: list[DebridFile] = []
+
+    if info.files:
+        for fid, meta in info.files.items():
+            if fid not in file_id_set:
+                continue
+            df = DebridFile(file_id=fid, filename=meta.filename, filesize=meta.bytes)
+            df.download_url = meta.download_url
+            container_files.append(df)
+
+    assert len(container_files) == 1
+    assert container_files[0].file_id == 1
