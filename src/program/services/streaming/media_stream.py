@@ -2,6 +2,7 @@ import trio
 import trio_util
 import pyfuse3
 import httpx
+import os
 import socket as _socket_module
 import struct
 
@@ -863,7 +864,43 @@ class MediaStream:
 
                     self.session_statistics.total_session_connections += 1
 
-                    yield stream
+                    _dup_fd = -1
+                    _orig_fd = -1
+                    try:
+                        _ns = stream.extensions.get("network_stream")
+                        if _ns is not None:
+                            _raw = _ns.get_extra_info("socket")
+                            if _raw is not None:
+                                _orig_fd = _raw.fileno()
+                                if _orig_fd >= 0:
+                                    _dup_fd = os.dup(_orig_fd)
+                    except Exception:
+                        pass
+
+                    try:
+                        yield stream
+                    finally:
+                        if self.is_killed.value:
+                            try:
+                                # Set SO_LINGER(RST) via dup_fd; do NOT close orig_fd.
+                                # httpx __aexit__ closes orig_fd (the last ref) and the
+                                # kernel fires RST — no double-close, no EBADF.
+                                if _dup_fd >= 0:
+                                    with _socket_module.socket(fileno=_dup_fd) as _s:
+                                        _s.setsockopt(
+                                            _socket_module.SOL_SOCKET,
+                                            _socket_module.SO_LINGER,
+                                            struct.pack("ii", 1, 0),
+                                        )
+                                    _dup_fd = -1
+                                    logger.warning(self.build_log_message("Set SO_LINGER RST on socket"))
+                            except Exception as _e:
+                                logger.warning(self.build_log_message(f"Failed SO_LINGER: {_e}"))
+                        if _dup_fd >= 0:
+                            try:
+                                os.close(_dup_fd)
+                            except Exception:
+                                pass
 
                     return
             except httpx.HTTPStatusError as e:
