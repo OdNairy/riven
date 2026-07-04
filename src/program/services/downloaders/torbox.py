@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
-import requests
 from loguru import logger
 
 from program.media.item import ProcessedItemType
@@ -695,50 +694,27 @@ class TorBoxDownloader(DownloaderBase):
 
     def unrestrict_link(self, link: str) -> UnrestrictedLink | None:
         """
-        Resolve a TorBox ``requestdl`` permalink (or follow redirects) to a direct CDN URL.
+        Resolve a TorBox requestdl permalink to a direct CDN URL.
+
+        Uses SmartSession (rate-limited, circuit-breaker) with allow_redirects=False
+        to capture the Location header without reading the multi-GB file body.
         """
-
-        proxies: dict[str, str] | None = None
-
-        if self.api and getattr(self.api.session, "proxies", None):
-            p = self.api.session.proxies
-
-            if p:
-                proxies = p
+        assert self.api
 
         try:
-            # stream=True: do not read the full response body; ``requestdl`` can redirect
-            # to the CDN with a multi-GB body; without streaming, urllib3 reads until EOF.
-            with requests.get(
-                link,
-                allow_redirects=True,
-                timeout=(15.0, 45.0),
-                headers={"User-Agent": "Riven/1.0"},
-                proxies=proxies,
-                stream=True,
-            ) as r:
-                r.raise_for_status()
+            response = self.api.session.get(link, allow_redirects=False)
 
-                logger.debug(
-                    f"TorBox unrestrict_link ok status={r.status_code} "
-                    f"final={r.url[:80]}"
-                )
+            self._maybe_backoff(response)
 
-                final_url = r.url
-                fname = _parse_content_disposition_filename(r.headers.get("Content-Disposition"))
-                clen = r.headers.get("Content-Length")
+            if response.status_code in (301, 302, 303, 307, 308):
+                cdn_url = response.headers.get("Location") or response.headers.get("location")
+                if cdn_url:
+                    logger.debug(f"TorBox unrestrict_link ok: {cdn_url[:80]}")
+                    fname = cdn_url.rsplit("/", 1)[-1].split("?", 1)[0]
+                    return UnrestrictedLink(download=cdn_url, filename=fname or "download", filesize=0)
 
-                try:
-                    fsize = int(clen) if clen else 0
-                except ValueError:
-                    fsize = 0
-
-                if not fname and final_url:
-                    fname = final_url.rsplit("/", 1)[-1].split("?", 1)[0]
-
-                return UnrestrictedLink(download=final_url, filename=fname or "download", filesize=fsize)
+            logger.debug(f"TorBox unrestrict_link unexpected status={response.status_code} for {link[:80]}")
+            return None
         except Exception as e:
-            logger.debug(
-                f"TorBox unrestrict_link failed for url={link[:80]}: {e}"
-            )
+            logger.debug(f"TorBox unrestrict_link failed for {link[:80]}: {e}")
             return None
