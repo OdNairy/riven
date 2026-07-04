@@ -5,6 +5,7 @@ import httpx
 import os
 import socket as _socket_module
 import struct
+import time
 
 from functools import cached_property
 from contextlib import asynccontextmanager
@@ -47,6 +48,58 @@ from .stream_connection import StreamConnection
 
 # Providers that require proxy connections for streaming
 PROXY_REQUIRED_PROVIDERS = {"alldebrid"}
+
+
+class _AsyncTokenBucket:
+    """Trio-native async token bucket, used to throttle streaming requests."""
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = capacity
+        # time.monotonic(), not trio.current_time(): this bucket is
+        # constructed at import time, before any trio run loop exists.
+        self.last_refill = time.monotonic()
+        self._lock = trio.Lock()
+
+    async def acquire(self, max_wait: float = 2.0) -> None:
+        """
+        Best-effort throttle: waits for a token up to ``max_wait`` seconds,
+        then gives up and lets the caller proceed unthrottled.
+
+        This must stay well under callers' own connect timeouts. Under a
+        heavy burst (hundreds of concurrent stream opens), a strict/unbounded
+        wait here can queue a read for many seconds, which can outlive the
+        stream's connect timeout and race the file handle being torn down
+        concurrently (surfaces as "Nursery is closed to new arrivals" and
+        crashes the whole FUSE loop, not just one read). Any 429/5xx that
+        slips through here is still handled by establish_connection's
+        retry-with-backoff.
+        """
+
+        with trio.move_on_after(max_wait):
+            async with self._lock:
+                while True:
+                    now = time.monotonic()
+                    self.tokens = min(
+                        self.capacity, self.tokens + (now - self.last_refill) * self.rate
+                    )
+                    self.last_refill = now
+
+                    if self.tokens >= 1:
+                        self.tokens -= 1
+
+                        return
+
+                    await trio.sleep((1 - self.tokens) / self.rate)
+
+
+# TorBox's requestdl endpoint resolves a fresh CDN redirect on every call and
+# is not cached across reads/seeks, so every byte-range read on a torbox
+# stream hits it directly. TorBox enforces its own per-account rate limit on
+# this endpoint, so bursts of concurrent file opens (e.g. a media server
+# scanning a season) can trip its 429s. Throttle client-side to stay under it.
+_TORBOX_STREAM_RATE_LIMITER = _AsyncTokenBucket(rate=3.0, capacity=5)
 
 
 type ReadType = Literal[
@@ -823,6 +876,9 @@ class MediaStream:
 
         for attempt in range(max_attempts):
             try:
+                if self.provider == "torbox":
+                    await _TORBOX_STREAM_RATE_LIMITER.acquire()
+
                 async with self.async_client.stream(
                     method="GET",
                     url=self.target_url.value,
@@ -968,6 +1024,25 @@ class MediaStream:
 
                     raise DebridServiceRateLimitedException(
                         provider=self.provider
+                    ) from e
+                elif 500 <= status_code < 600:
+                    # Transient upstream/server error - back off and retry
+                    logger.warning(
+                        self.build_log_message(
+                            f"HTTP {status_code} server error - attempt {attempt + 1}"
+                        )
+                    )
+
+                    if await self._retry_with_backoff(
+                        attempt,
+                        max_attempts,
+                        backoffs,
+                    ):
+                        continue
+
+                    raise DebridServiceException(
+                        f"Persistent HTTP {status_code} error connecting to stream",
+                        provider=self.provider,
                     ) from e
                 else:
                     # Other unexpected status codes

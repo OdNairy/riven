@@ -212,6 +212,17 @@ class TorBoxDownloader(DownloaderBase):
             logger.error(f"Failed to validate TorBox premium status: {e}")
             return False
 
+    def _maybe_backoff(self, response: SmartResponse) -> None:
+        """
+        Promote TorBox 429/5xx responses to a service-level backoff signal.
+        """
+
+        code = response.status_code
+
+        if code == 429 or (500 <= code < 600):
+            # Name matches the breaker key in SmartSession rate_limits/breakers
+            raise CircuitBreakerOpen("api.torbox.app")
+
     def _get_json(self, response: SmartResponse) -> dict[str, Any]:
         if not response.ok:
             raise TorBoxError(response.reason or f"HTTP {response.status_code}")
@@ -340,7 +351,7 @@ class TorBoxDownloader(DownloaderBase):
             try:
                 df = DebridFile.create(
                     path=path,
-                    filename=path,
+                    filename=path.rsplit("/", 1)[-1],
                     filesize_bytes=nbytes,
                     filetype=item_type,
                     file_id=fid,
@@ -424,38 +435,6 @@ class TorBoxDownloader(DownloaderBase):
             "TorBox prepare_download: done in {:.2f}s (torrent_id={})",
             time.monotonic() - t0, torrent_id,
         )
-
-    def _build_container_from_info(
-        self,
-        infohash: str,
-        item_type: ProcessedItemType,
-        info: TorrentInfo,
-    ) -> tuple[TorrentContainer | None, str | None]:
-        if not info.files:
-            return None, "no files on torrent after TorBox reported ready"
-
-        files = list[DebridFile]()
-
-        for file_id, tf in info.files.items():
-            try:
-                df = DebridFile.create(
-                    path=tf.path,
-                    filename=tf.filename,
-                    filesize_bytes=tf.bytes,
-                    filetype=item_type,
-                    file_id=file_id,
-                )
-            except InvalidDebridFileException as e:
-                logger.debug(f"{infohash}: {e}")
-                continue
-
-            df.download_url = _requestdl_permalink(self.settings.api_key, info.id, file_id)
-            files.append(df)
-
-        if not files:
-            return None, "no valid video files after validation"
-
-        return TorrentContainer(infohash=infohash, files=files), None
 
     def add_torrent(self, infohash: str) -> str:
         assert self.api
@@ -569,7 +548,11 @@ class TorBoxDownloader(DownloaderBase):
                 path=path,
                 bytes=nbytes,
                 selected=1,
-                download_url="",
+                download_url=(
+                    _requestdl_permalink(self.settings.api_key, tid, fid)
+                    if tid is not None
+                    else ""
+                ),
             )
 
         added = row.get("created_at") or row.get("created") or row.get("added") or row.get("createdat")
