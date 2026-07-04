@@ -280,11 +280,16 @@ class TorBoxDownloader(DownloaderBase):
             container = self._build_container_from_checkcached(
                 infohash, item_type, cached_rows[0]
             )
-            if container:
-                logger.debug(
-                    "TorBox checkcached hit for {} ({} files) in {:.2f}s",
-                    infohash, len(container.files), time.monotonic() - t0,
-                )
+            if not container:
+                return None
+
+            # rivenmedia orchestrator requires torrent_id + download_url set before return
+            self.prepare_download(container, infohash)
+
+            logger.debug(
+                "TorBox checkcached hit for {} ({} files) in {:.2f}s",
+                infohash, len(container.files), time.monotonic() - t0,
+            )
             return container
 
         except CircuitBreakerOpen:
@@ -693,8 +698,6 @@ class TorBoxDownloader(DownloaderBase):
         Resolve a TorBox ``requestdl`` permalink (or follow redirects) to a direct CDN URL.
         """
 
-        from program.utils.debrid_cdn_url import _url_log_hint
-
         proxies: dict[str, str] | None = None
 
         if self.api and getattr(self.api.session, "proxies", None):
@@ -718,7 +721,7 @@ class TorBoxDownloader(DownloaderBase):
 
                 logger.debug(
                     f"TorBox unrestrict_link ok status={r.status_code} "
-                    f"final={_url_log_hint(r.url)}"
+                    f"final={r.url[:80]}"
                 )
 
                 final_url = r.url
@@ -736,6 +739,6 @@ class TorBoxDownloader(DownloaderBase):
                 return UnrestrictedLink(download=final_url, filename=fname or "download", filesize=fsize)
         except Exception as e:
             logger.debug(
-                f"TorBox unrestrict_link failed for url={_url_log_hint(link)}: {e}"
+                f"TorBox unrestrict_link failed for url={link[:80]}: {e}"
             )
             return None
