@@ -19,8 +19,7 @@ from program.services.downloaders.models import (
     UserInfo,
 )
 from program.settings import settings_manager
-from program.services.rate_limit import CircuitBreakerOpen, ResourceSpec
-from program.utils.request import SmartResponse, SmartSession
+from program.utils.request import CircuitBreakerOpen, SmartResponse, SmartSession
 
 from .shared import DownloaderBase, premium_days_left
 
@@ -131,12 +130,8 @@ class TorBoxAPI:
 
         self.session = SmartSession(
             base_url=self.BASE_URL,
-            rate_limit_map={
-                "api.torbox.app": ["torbox.api"],
-                # torbox.createtorrent removed: the separate 60/hour rate limiter caused
-                # TokenBucket.wait() to block the calling thread for 60-200+ seconds when
-                # multiple jobs queued up. The general torbox.api limit (300/min) is
-                # sufficient; if TorBox returns 429, SmartSession's backoff handles it.
+            rate_limits={
+                "api.torbox.app": {"rate": 5.0, "capacity": 8},
             },
             proxies=proxies,
             retries=2,
@@ -155,22 +150,6 @@ class TorBoxDownloader(DownloaderBase):
     Uses TorBox ``checkcached`` first, then ``createtorrent`` + ``mylist`` polling.
     File URLs are stored as ``requestdl`` permalinks (token in query) per TorBox guidance.
     """
-
-    API_BREAKER_DOMAIN = "api.torbox.app"
-    API_RATE_PER_SECOND = 5.0
-    PRIMARY_LIMIT_KEY = "torbox.api"
-    LIMIT_SPECS = {
-        "torbox.api": ResourceSpec(
-            label="General API (300/min)",
-            owner="torbox",
-            rate=5.0,   # 300/min = 5 tokens/s sustained
-            # capacity=8: ~1.6 s burst at full rate before throttling.
-            # TorBox's get_instant_availability is now a single checkcached call,
-            # so 8 tokens supports 8 concurrent availability checks before pacing.
-            capacity=8,
-        ),
-        # torbox.createtorrent removed: see TorBoxAPI comment above.
-    }
 
     _STILL_FETCHING_STATES = frozenset(
         {
@@ -199,7 +178,6 @@ class TorBoxDownloader(DownloaderBase):
         if not self._validate_settings():
             return False
 
-        self.register_limits()
         proxy_url = self.PROXY_URL or None
         self.api = TorBoxAPI(api_key=self.settings.api_key, proxy_url=proxy_url)
 
