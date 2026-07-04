@@ -17,6 +17,9 @@ from program.services.downloaders.models import (
     UnrestrictedLink,
     UserInfo,
 )
+from program.services.streaming.exceptions.debrid_service_exception import (
+    DebridServiceLinkUnavailable,
+)
 from program.settings import settings_manager
 from program.utils.request import CircuitBreakerOpen, SmartResponse, SmartSession
 
@@ -97,11 +100,6 @@ def _collect_file_dicts(node: Any) -> list[dict[str, Any]]:
             o = _lower_key_dict(obj)
             has_id = "id" in o
             name = o.get("name") or o.get("short_name") or o.get("filename")
-            size = o.get("size")
-            if size is None:
-                size = o.get("bytes")
-            if size is None:
-                size = o.get("file_size")
 
             if has_id and name is not None:
                 try:
@@ -143,29 +141,16 @@ class TorBoxDownloader(DownloaderBase):
     """
     TorBox debrid downloader.
 
-    Flow mirrors Real-Debrid: ``get_instant_availability`` leaves ``torrent_id`` and
-    ``torrent_info`` on the container so the orchestrator does not re-add the torrent.
+    ``get_instant_availability`` checks ``checkcached`` and, on a hit, immediately
+    adds the torrent to the account (``createtorrent``) so the container carries a
+    ``torrent_id`` and ``torrent_info`` before it returns. The rivenmedia
+    orchestrator reuses those values and never adds the torrent itself, so they
+    must be populated here.
 
-    Uses TorBox ``checkcached`` first, then ``createtorrent`` + ``mylist`` polling.
-    File URLs are stored as ``requestdl`` permalinks (token in query) per TorBox guidance.
+    File URLs are stored as ``requestdl`` permalinks (token in query) per TorBox
+    guidance; the ``file_id`` in a permalink is the file's 0-based position in the
+    torrent's file list.
     """
-
-    _STILL_FETCHING_STATES = frozenset(
-        {
-            "downloading",
-            "queued",
-            "metadl",
-            "magnet_conversion",
-            "checkingresumedata",
-        }
-    )
-    _BAD_STATES = frozenset(
-        {
-            "error",
-            "dead",
-            "magnet_error",
-        }
-    )
 
     def __init__(self) -> None:
         self.key = "torbox"
@@ -267,15 +252,15 @@ class TorBoxDownloader(DownloaderBase):
         """
         Check TorBox instant availability.
 
-        Only calls checkcached — does NOT call createtorrent.  The torrent is
-        added to the account in prepare_download(), which is called by the
-        orchestrator only when the stream is actually going to be downloaded.
+        Calls ``checkcached``; on a cache hit it then calls ``prepare_download``
+        (``createtorrent`` + requestdl URL construction) so the returned container
+        already carries ``torrent_id`` and ``torrent_info``. The orchestrator's
+        ``download_cached_stream_on_service`` asserts ``container.torrent_id`` and
+        does not add the torrent itself, so it must be populated here.
 
-        This eliminates the root cause of the 175-223 s blocking: the
-        torbox.createtorrent TokenBucket was set to 1 token/60 s, so multiple
-        parallel jobs queued up and each waited 60, 120, 180 … seconds.  By
-        deferring createtorrent to download time, get_instant_availability is
-        a single fast checkcached call (~200 ms).
+        Note: ``createtorrent`` therefore runs during availability checks, not only
+        at download time. It is cheap here because the host rate limiter is a
+        shared 5 req/s bucket rather than the old 1 token/60 s per-endpoint bucket.
         """
         assert self.api
 
@@ -298,7 +283,9 @@ class TorBoxDownloader(DownloaderBase):
 
             logger.debug(
                 "TorBox checkcached hit for {} ({} files) in {:.2f}s",
-                infohash, len(container.files), time.monotonic() - t0,
+                infohash,
+                len(container.files),
+                time.monotonic() - t0,
             )
             return container
 
@@ -310,6 +297,35 @@ class TorBoxDownloader(DownloaderBase):
         except Exception as e:
             logger.debug("TorBox availability check failed [{}]: {}", infohash, e)
             return None
+
+    @staticmethod
+    def _ordered_torbox_files(raw_files: Any) -> list[tuple[int, dict[str, Any]]]:
+        """
+        Yield ``(file_id, file_dict)`` pairs from a TorBox files payload.
+
+        Per the TorBox API, the ``requestdl`` ``file_id`` is the file's 0-based
+        position within the torrent's file list — ``checkcached`` rows do not carry
+        an ``id`` field. We therefore enumerate the ordered list, preferring an
+        explicit integer ``id`` only when the payload actually provides one (e.g.
+        ``mylist``).
+        """
+
+        if isinstance(raw_files, list):
+            flat = [_lower_key_dict(x) for x in raw_files if isinstance(x, dict)]
+        else:
+            flat = [_lower_key_dict(x) for x in _collect_file_dicts(raw_files)]
+
+        ordered: list[tuple[int, dict[str, Any]]] = []
+
+        for idx, f in enumerate(flat):
+            try:
+                fid = int(f["id"])
+            except (KeyError, TypeError, ValueError):
+                fid = idx
+
+            ordered.append((fid, f))
+
+        return ordered
 
     def _build_container_from_checkcached(
         self,
@@ -325,33 +341,23 @@ class TorBoxDownloader(DownloaderBase):
         """
         row = _lower_key_dict(cached_row)
         raw_files = row.get("files") or row.get("file_list") or []
-        leafs = _collect_file_dicts(raw_files)
-
-        if not leafs and isinstance(raw_files, list):
-            leafs = [
-                _lower_key_dict(x)
-                for x in raw_files
-                if isinstance(x, dict) and any(str(k).lower() == "id" for k in x)
-            ]
 
         files: list[DebridFile] = []
-        for f in leafs:
-            f = _lower_key_dict(f)
+        for fid, f in self._ordered_torbox_files(raw_files):
+            short = f.get("short_name")
+            path = str(f.get("name") or f.get("path") or short or infohash)
+            # filename must be the basename: prefer TorBox's short_name, else the
+            # last path segment (checkcached rows carry only the full "name").
+            filename = str(short) if short else path.rsplit("/", 1)[-1]
             try:
-                fid = int(f["id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-
-            path = str(f.get("name") or f.get("path") or infohash)
-            try:
-                nbytes = int(f.get("size") or f.get("bytes") or 0)
+                nbytes = int(f.get("size") or f.get("bytes") or f.get("file_size") or 0)
             except (TypeError, ValueError):
                 nbytes = 0
 
             try:
                 df = DebridFile.create(
                     path=path,
-                    filename=path.rsplit("/", 1)[-1],
+                    filename=filename,
                     filesize_bytes=nbytes,
                     filetype=item_type,
                     file_id=fid,
@@ -366,7 +372,8 @@ class TorBoxDownloader(DownloaderBase):
         if not files:
             logger.debug(
                 "TorBox checkcached row for {} has no parseable files (keys={})",
-                infohash, list(row.keys()),
+                infohash,
+                list(row.keys()),
             )
             return None
 
@@ -377,22 +384,21 @@ class TorBoxDownloader(DownloaderBase):
         """
         Add the torrent to the TorBox account and finalize the container.
 
-        Called by the orchestrator when container.torrent_id is None, i.e. when
-        get_instant_availability() deferred the createtorrent call to download time.
+        Called from get_instant_availability() on a checkcached hit. The
+        orchestrator has no separate prepare step — it asserts and reuses
+        container.torrent_id — so these must be set before we return.
 
         After this method returns:
           - container.torrent_id is set to the new account torrent ID
           - each DebridFile.download_url is a requestdl permalink
           - container.torrent_info is set to a minimal TorrentInfo
-
-        The createtorrent call happens here rather than in get_instant_availability
-        so that it is only made when we are certain we will download the stream.
         """
         assert self.api
         t0 = time.monotonic()
         logger.info(
             "TorBox prepare_download: add_torrent for {} ({} files)",
-            infohash, len(container.files),
+            infohash,
+            len(container.files),
         )
 
         torrent_id = self.add_torrent(infohash)
@@ -433,7 +439,8 @@ class TorBoxDownloader(DownloaderBase):
 
         logger.info(
             "TorBox prepare_download: done in {:.2f}s (torrent_id={})",
-            time.monotonic() - t0, torrent_id,
+            time.monotonic() - t0,
+            torrent_id,
         )
 
     def add_torrent(self, infohash: str) -> str:
@@ -452,7 +459,9 @@ class TorBoxDownloader(DownloaderBase):
             raise TorBoxError("createtorrent returned unexpected data")
 
         d = _lower_key_dict(data)
-        tid = d.get("torrent_id") or d.get("torrentid") or d.get("id") or d.get("queuedid")
+        # _lower_key_dict only lowercases keys (underscores kept), so the real
+        # TorBox field names are torrent_id / id / queued_id.
+        tid = d.get("torrent_id") or d.get("id") or d.get("queued_id")
 
         if tid is None:
             raise TorBoxError("createtorrent returned no torrent_id")
@@ -484,7 +493,14 @@ class TorBoxDownloader(DownloaderBase):
             def row_id(x: dict[str, Any]) -> str:
                 return str(_lower_key_dict(x).get("id", ""))
 
-            row = next((x for x in data if isinstance(x, dict) and row_id(x) == str(torrent_id)), data[0])
+            row = next(
+                (
+                    x
+                    for x in data
+                    if isinstance(x, dict) and row_id(x) == str(torrent_id)
+                ),
+                data[0],
+            )
         elif isinstance(data, dict):
             row = data
         else:
@@ -519,27 +535,16 @@ class TorBoxDownloader(DownloaderBase):
         if isinstance(tor, dict) and not raw_files:
             raw_files = _lower_key_dict(tor).get("files") or []
 
-        leafs = _collect_file_dicts(raw_files)
-
-        if not leafs and isinstance(raw_files, list):
-            leafs = [
-                _lower_key_dict(x)
-                for x in raw_files
-                if isinstance(x, dict) and any(str(k).lower() == "id" for k in x)
-            ]
-
         files: dict[int, TorrentFile] = {}
 
-        for f in leafs:
-            f = _lower_key_dict(f) if f else f
+        for fid, f in self._ordered_torbox_files(raw_files):
+            # TorrentFile.filename derives the basename from path, so store the
+            # full name here.
+            path = str(
+                f.get("name") or f.get("path") or f.get("short_name") or display_name
+            )
             try:
-                fid = int(f["id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-
-            path = str(f.get("name") or f.get("path") or display_name)
-            try:
-                nbytes = int(f.get("size") or f.get("bytes") or 0)
+                nbytes = int(f.get("size") or f.get("bytes") or f.get("file_size") or 0)
             except (TypeError, ValueError):
                 nbytes = 0
 
@@ -555,7 +560,12 @@ class TorBoxDownloader(DownloaderBase):
                 ),
             )
 
-        added = row.get("created_at") or row.get("created") or row.get("added") or row.get("createdat")
+        added = (
+            row.get("created_at")
+            or row.get("created")
+            or row.get("added")
+            or row.get("createdat")
+        )
 
         created: datetime | None = None
 
@@ -586,9 +596,16 @@ class TorBoxDownloader(DownloaderBase):
     def delete_torrent(self, torrent_id: int | str) -> None:
         assert self.api
 
+        # TorBox's ControlTorrent schema types torrent_id as an integer; sending a
+        # string trips its 422 validation. Coerce, falling back to the raw value.
+        try:
+            tid: int | str = int(torrent_id)
+        except (TypeError, ValueError):
+            tid = torrent_id
+
         resp = self.api.session.post(
             "torrents/controltorrent",
-            json={"torrent_id": str(torrent_id), "operation": "delete"},
+            json={"torrent_id": tid, "operation": "delete"},
             timeout=30,
         )
 
@@ -616,7 +633,8 @@ class TorBoxDownloader(DownloaderBase):
             d = _lower_key_dict(data)
 
             plan = d.get("plan")
-            is_subscribed = d.get("issubscribed")
+            # Real TorBox field is is_subscribed (underscore kept by _lower_key_dict).
+            is_subscribed = d.get("is_subscribed")
 
             if is_subscribed is True:
                 premium_ok = True
@@ -660,11 +678,13 @@ class TorBoxDownloader(DownloaderBase):
                 email=d.get("email"),
                 user_id=uid,
                 premium_status="premium" if premium_ok else "free",
-                premium_expires_at=expiration.replace(tzinfo=None) if expiration else None,
+                premium_expires_at=(
+                    expiration.replace(tzinfo=None) if expiration else None
+                ),
                 premium_days_left=premium_days,
                 total_downloaded_bytes=(
                     int(td)
-                    if isinstance((td := d.get("totaldownloaded")), (int, float))
+                    if isinstance((td := d.get("total_downloaded")), (int, float))
                     else None
                 ),
             )
@@ -680,24 +700,52 @@ class TorBoxDownloader(DownloaderBase):
         Resolve a TorBox requestdl permalink to a direct CDN URL.
 
         Uses SmartSession (rate-limited, circuit-breaker) with allow_redirects=False
-        to capture the Location header without reading the multi-GB file body.
+        and stream=True so only the redirect headers are read — never the (multi-GB)
+        file body, even if TorBox ever answers 200 instead of a 3xx redirect.
+
+        Raises DebridServiceLinkUnavailable when the link is permanently gone so the
+        VFS refresh path can blacklist the stream and trigger a re-download, and lets
+        CircuitBreakerOpen propagate so 429/5xx bursts back off.
         """
         assert self.api
 
         try:
-            response = self.api.session.get(link, allow_redirects=False)
+            response = self.api.session.get(link, allow_redirects=False, stream=True)
 
-            self._maybe_backoff(response)
+            try:
+                self._maybe_backoff(response)
 
-            if response.status_code in (301, 302, 303, 307, 308):
-                cdn_url = response.headers.get("Location") or response.headers.get("location")
-                if cdn_url:
-                    logger.debug(f"TorBox unrestrict_link ok: {cdn_url[:80]}")
-                    fname = cdn_url.rsplit("/", 1)[-1].split("?", 1)[0]
-                    return UnrestrictedLink(download=cdn_url, filename=fname or "download", filesize=0)
+                if response.status_code in (301, 302, 303, 307, 308):
+                    cdn_url = response.headers.get("Location") or response.headers.get(
+                        "location"
+                    )
+                    if cdn_url:
+                        logger.debug(f"TorBox unrestrict_link ok: {cdn_url[:80]}")
+                        fname = cdn_url.rsplit("/", 1)[-1].split("?", 1)[0]
+                        return UnrestrictedLink(
+                            download=cdn_url, filename=fname or "download", filesize=0
+                        )
 
-            logger.debug(f"TorBox unrestrict_link unexpected status={response.status_code} for {link[:80]}")
-            return None
+                    logger.debug(
+                        f"TorBox unrestrict_link: redirect without Location for {link[:80]}"
+                    )
+                    return None
+
+                if response.status_code in (404, 410):
+                    # File/torrent no longer resolvable on the account.
+                    raise DebridServiceLinkUnavailable(provider=self.key, link=link)
+
+                logger.debug(
+                    f"TorBox unrestrict_link unexpected status={response.status_code} for {link[:80]}"
+                )
+                return None
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        except (CircuitBreakerOpen, DebridServiceLinkUnavailable):
+            raise
         except Exception as e:
             logger.debug(f"TorBox unrestrict_link failed for {link[:80]}: {e}")
             return None
