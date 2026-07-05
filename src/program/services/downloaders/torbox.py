@@ -208,6 +208,25 @@ class TorBoxDownloader(DownloaderBase):
             # Name matches the breaker key in SmartSession rate_limits/breakers
             raise CircuitBreakerOpen("api.torbox.app")
 
+    def _account_healthy(self) -> bool:
+        """
+        Cheap account-level health probe (``user/me``).
+
+        Used to tell a torrent-specific failure apart from a wider TorBox outage:
+        if ``requestdl`` 5xxs but this returns True, the account is reachable and
+        the torrent itself is broken; if it also fails, TorBox is down and we must
+        not treat every stream as unavailable.
+        """
+
+        assert self.api
+
+        try:
+            body = self._get_json(self.api.session.get("user/me", timeout=10))
+            _unwrap_data(body)  # raises TorBoxError on a success:false envelope
+            return True
+        except Exception:
+            return False
+
     def _get_json(self, response: SmartResponse) -> dict[str, Any]:
         if not response.ok:
             raise TorBoxError(response.reason or f"HTTP {response.status_code}")
@@ -703,9 +722,11 @@ class TorBoxDownloader(DownloaderBase):
         and stream=True so only the redirect headers are read — never the (multi-GB)
         file body, even if TorBox ever answers 200 instead of a 3xx redirect.
 
-        Raises DebridServiceLinkUnavailable when the link is permanently gone so the
-        VFS refresh path can blacklist the stream and trigger a re-download, and lets
-        CircuitBreakerOpen propagate so 429/5xx bursts back off.
+        Raises DebridServiceLinkUnavailable when the torrent is gone (404/410) or
+        broken on TorBox's side (5xx while the account health probe still passes), so
+        the VFS refresh path can blacklist the stream and re-acquire the content.
+        During a wider TorBox outage the health probe fails and CircuitBreakerOpen is
+        raised instead, so we back off without discarding every item.
         """
         assert self.api
 
@@ -713,8 +734,6 @@ class TorBoxDownloader(DownloaderBase):
             response = self.api.session.get(link, allow_redirects=False, stream=True)
 
             try:
-                self._maybe_backoff(response)
-
                 if response.status_code in (301, 302, 303, 307, 308):
                     cdn_url = response.headers.get("Location") or response.headers.get(
                         "location"
@@ -734,6 +753,24 @@ class TorBoxDownloader(DownloaderBase):
                 if response.status_code in (404, 410):
                     # File/torrent no longer resolvable on the account.
                     raise DebridServiceLinkUnavailable(provider=self.key, link=link)
+
+                if 500 <= response.status_code < 600 and self._account_healthy():
+                    # requestdl 5xx (e.g. TorBox DATABASE_ERROR) while the account
+                    # is otherwise reachable => this torrent is broken on TorBox's
+                    # side. Trigger re-acquisition instead of streaming a dead
+                    # permalink forever. A wider TorBox outage fails the health
+                    # probe and falls through to backoff below, so we don't nuke
+                    # every item when TorBox itself is down.
+                    logger.warning(
+                        "TorBox requestdl {} on a healthy account; treating torrent "
+                        "as unavailable: {}",
+                        response.status_code,
+                        link[:80],
+                    )
+                    raise DebridServiceLinkUnavailable(provider=self.key, link=link)
+
+                # 429, or 5xx during a wider outage: back off, keep the item.
+                self._maybe_backoff(response)
 
                 logger.debug(
                     f"TorBox unrestrict_link unexpected status={response.status_code} for {link[:80]}"

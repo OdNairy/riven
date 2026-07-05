@@ -78,6 +78,17 @@ def envelope(data, success=True):
     return {"success": success, "data": data}
 
 
+def routed_get(requestdl_resp, user_me_resp):
+    """Route session.get: user/me -> health probe response, else requestdl."""
+
+    def _router(url, **_kwargs):
+        if "user/me" in url:
+            return user_me_resp
+        return requestdl_resp
+
+    return MagicMock(side_effect=_router)
+
+
 # ---------------------------------------------------------------------------
 # _ordered_torbox_files — the core file_id fix
 # ---------------------------------------------------------------------------
@@ -416,3 +427,49 @@ def test_unrestrict_link_unexpected_status_returns_none():
         dl.unrestrict_link("https://api.torbox.app/v1/api/torrents/requestdl") is None
     )
     assert resp.closed is True
+
+
+LINK = "https://api.torbox.app/v1/api/torrents/requestdl?torrent_id=49883717&file_id=2"
+
+
+def test_unrestrict_link_5xx_healthy_account_raises_link_unavailable():
+    # requestdl 5xx (TorBox DATABASE_ERROR) but the account is reachable ->
+    # the torrent is broken on TorBox's side -> trigger re-acquisition.
+    dl = make_downloader()
+    req = FakeResp(status_code=500)
+    me = FakeResp(status_code=200, json_data=envelope({"id": 1, "plan": 2}))
+    dl.api.session.get = routed_get(req, me)
+
+    with pytest.raises(DebridServiceLinkUnavailable):
+        dl.unrestrict_link(LINK)
+    assert req.closed is True
+
+
+def test_unrestrict_link_5xx_unhealthy_account_backs_off():
+    # requestdl 5xx AND the health probe fails -> wider TorBox outage ->
+    # back off (CircuitBreakerOpen), do NOT discard the item.
+    dl = make_downloader()
+    req = FakeResp(status_code=500)
+    me = FakeResp(status_code=500)
+    dl.api.session.get = routed_get(req, me)
+
+    with pytest.raises(CircuitBreakerOpen):
+        dl.unrestrict_link(LINK)
+    assert req.closed is True
+
+
+def test_account_healthy_probe():
+    dl = make_downloader()
+    dl.api.session.get = MagicMock(
+        return_value=FakeResp(json_data=envelope({"id": 1, "plan": 2}))
+    )
+    assert dl._account_healthy() is True
+
+    dl.api.session.get = MagicMock(return_value=FakeResp(status_code=500))
+    assert dl._account_healthy() is False
+
+    # success:false envelope (e.g. DATABASE_ERROR) is not healthy
+    dl.api.session.get = MagicMock(
+        return_value=FakeResp(json_data=envelope(None, success=False))
+    )
+    assert dl._account_healthy() is False
