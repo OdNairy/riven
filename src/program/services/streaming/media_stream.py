@@ -1,19 +1,19 @@
-import trio
-import trio_util
-import pyfuse3
-import httpx
 import os
 import socket as _socket_module
 import struct
 import time
-
-from functools import cached_property
-from contextlib import asynccontextmanager
-from loguru import logger
-from typing import Any, Literal
-from http import HTTPStatus
-from kink import di
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
+from functools import cached_property
+from http import HTTPStatus
+from typing import Any, Literal
+
+import httpx
+import pyfuse3
+import trio
+import trio_util
+from kink import di
+from loguru import logger
 from ordered_set import OrderedSet
 
 from program.settings import settings_manager
@@ -21,30 +21,29 @@ from program.utils import benchmark
 from program.utils.async_client import AsyncClient
 from program.utils.proxy_client import ProxyClient
 
-from .chunker import Chunk, ChunkCacheNotifier, ChunkRange, Chunker
+from .chunker import Chunk, ChunkCacheNotifier, Chunker, ChunkRange
 from .config import Config
 from .exceptions import (
+    ByteLengthMismatchException,
     CacheDataNotFoundException,
     ChunksTooSlowException,
-    EmptyDataException,
-    FatalMediaStreamException,
-    ByteLengthMismatchException,
-    RecoverableMediaStreamException,
     DebridServiceClosedConnectionException,
     DebridServiceException,
     DebridServiceForbiddenException,
+    DebridServiceLinkUnavailable,
     DebridServiceRangeNotSatisfiableException,
-    DebridServiceUnableToConnectException,
     DebridServiceRateLimitedException,
     DebridServiceRefusedRangeRequestException,
+    DebridServiceUnableToConnectException,
+    EmptyDataException,
+    FatalMediaStreamException,
     MediaStreamKilledException,
-    DebridServiceLinkUnavailable,
+    RecoverableMediaStreamException,
 )
 from .file_metadata import FileMetadata
 from .recent_reads import Read, RecentReads
 from .session_statistics import SessionStatistics
 from .stream_connection import StreamConnection
-
 
 # Providers that require proxy connections for streaming
 PROXY_REQUIRED_PROVIDERS = {"alldebrid"}
@@ -82,7 +81,8 @@ class _AsyncTokenBucket:
                 while True:
                     now = time.monotonic()
                     self.tokens = min(
-                        self.capacity, self.tokens + (now - self.last_refill) * self.rate
+                        self.capacity,
+                        self.tokens + (now - self.last_refill) * self.rate,
                     )
                     self.last_refill = now
 
@@ -623,7 +623,12 @@ class MediaStream:
                 struct.pack("ii", 1, 0),
             )
             if self.enable_tracing:
-                logger.log("STREAM", self.build_log_message("Applied SO_LINGER RST to connection socket"))
+                logger.log(
+                    "STREAM",
+                    self.build_log_message(
+                        "Applied SO_LINGER RST to connection socket"
+                    ),
+                )
         except Exception as e:
             logger.warning(self.build_log_message(f"Failed to apply SO_LINGER: {e}"))
 
@@ -949,9 +954,15 @@ class MediaStream:
                                             struct.pack("ii", 1, 0),
                                         )
                                     _dup_fd = -1
-                                    logger.warning(self.build_log_message("Set SO_LINGER RST on socket"))
+                                    logger.warning(
+                                        self.build_log_message(
+                                            "Set SO_LINGER RST on socket"
+                                        )
+                                    )
                             except Exception as _e:
-                                logger.warning(self.build_log_message(f"Failed SO_LINGER: {_e}"))
+                                logger.warning(
+                                    self.build_log_message(f"Failed SO_LINGER: {_e}")
+                                )
                         if _dup_fd >= 0:
                             try:
                                 os.close(_dup_fd)
@@ -980,7 +991,11 @@ class MediaStream:
                         continue
 
                     raise DebridServiceForbiddenException(provider=self.provider) from e
-                elif status_code in (HTTPStatus.NOT_FOUND, HTTPStatus.GONE, HTTPStatus.SERVICE_UNAVAILABLE):
+                elif status_code in (
+                    HTTPStatus.NOT_FOUND,
+                    HTTPStatus.GONE,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                ):
                     # File can't be found at this URL; try refreshing the URL once
                     if attempt == 0:
                         has_fresh_url = await self._refresh_download_url()
@@ -1300,10 +1315,19 @@ class MediaStream:
 
         from program.services.filesystem.vfs import VFSDatabase
 
-        # Query database by original_filename and force unrestrict
-        entry_info = di[VFSDatabase].get_entry_by_original_filename(
-            original_filename=self.file_metadata.original_filename,
-            force_resolve=True,
+        # Query database by original_filename and force unrestrict.
+        #
+        # get_entry_by_original_filename with force_resolve=True does blocking work
+        # (synchronous SQLAlchemy + a provider unrestrict over SmartSession, which
+        # sleeps for rate limiting/retries). This coroutine has no other checkpoint,
+        # so calling it directly would freeze the whole FUSE/trio event loop for the
+        # duration, stalling every other read. Run it in a worker thread so the loop
+        # stays responsive (mirrors rivenvfs.get_entry_by_original_filename usage).
+        entry_info = await trio.to_thread.run_sync(
+            lambda: di[VFSDatabase].get_entry_by_original_filename(
+                original_filename=self.file_metadata.original_filename,
+                force_resolve=True,
+            )
         )
 
         if entry_info:
