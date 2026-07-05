@@ -1048,6 +1048,19 @@ class MediaStream:
                         )
                     )
 
+                    if attempt == 0:
+                        # The CDN edge node serving this URL may be degraded;
+                        # try refreshing in case the provider hands out a
+                        # different node on re-unrestrict.
+                        has_fresh_url = await self._refresh_download_url()
+
+                        if has_fresh_url:
+                            logger.warning(
+                                self.build_log_message(
+                                    f"URL refresh after HTTP {status_code}"
+                                )
+                            )
+
                     if await self._retry_with_backoff(
                         attempt,
                         max_attempts,
