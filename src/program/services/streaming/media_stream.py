@@ -992,11 +992,14 @@ class MediaStream:
 
                     raise DebridServiceForbiddenException(provider=self.provider) from e
                 elif status_code in (
+                    HTTPStatus.BAD_REQUEST,
                     HTTPStatus.NOT_FOUND,
                     HTTPStatus.GONE,
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 ):
-                    # File can't be found at this URL; try refreshing the URL once
+                    # File can't be found at this URL (TorBox returns 400 "Invalid
+                    # Presigned Token" for an expired dld link); try refreshing once
+
                     if attempt == 0:
                         has_fresh_url = await self._refresh_download_url()
 
