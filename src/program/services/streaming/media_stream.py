@@ -1,18 +1,19 @@
-import trio
-import trio_util
-import pyfuse3
-import httpx
 import os
 import socket as _socket_module
 import struct
-
-from functools import cached_property
-from contextlib import asynccontextmanager
-from loguru import logger
-from typing import Any, Literal
-from http import HTTPStatus
-from kink import di
+import time
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
+from functools import cached_property
+from http import HTTPStatus
+from typing import Any, Literal
+
+import httpx
+import pyfuse3
+import trio
+import trio_util
+from kink import di
+from loguru import logger
 from ordered_set import OrderedSet
 
 from program.settings import settings_manager
@@ -20,33 +21,85 @@ from program.utils import benchmark
 from program.utils.async_client import AsyncClient
 from program.utils.proxy_client import ProxyClient
 
-from .chunker import Chunk, ChunkCacheNotifier, ChunkRange, Chunker
+from .chunker import Chunk, ChunkCacheNotifier, Chunker, ChunkRange
 from .config import Config
 from .exceptions import (
+    ByteLengthMismatchException,
     CacheDataNotFoundException,
     ChunksTooSlowException,
-    EmptyDataException,
-    FatalMediaStreamException,
-    ByteLengthMismatchException,
-    RecoverableMediaStreamException,
     DebridServiceClosedConnectionException,
     DebridServiceException,
     DebridServiceForbiddenException,
+    DebridServiceLinkUnavailable,
     DebridServiceRangeNotSatisfiableException,
-    DebridServiceUnableToConnectException,
     DebridServiceRateLimitedException,
     DebridServiceRefusedRangeRequestException,
+    DebridServiceUnableToConnectException,
+    EmptyDataException,
+    FatalMediaStreamException,
     MediaStreamKilledException,
-    DebridServiceLinkUnavailable,
+    RecoverableMediaStreamException,
 )
 from .file_metadata import FileMetadata
 from .recent_reads import Read, RecentReads
 from .session_statistics import SessionStatistics
 from .stream_connection import StreamConnection
 
-
 # Providers that require proxy connections for streaming
 PROXY_REQUIRED_PROVIDERS = {"alldebrid"}
+
+
+class _AsyncTokenBucket:
+    """Trio-native async token bucket, used to throttle streaming requests."""
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = capacity
+        # time.monotonic(), not trio.current_time(): this bucket is
+        # constructed at import time, before any trio run loop exists.
+        self.last_refill = time.monotonic()
+        self._lock = trio.Lock()
+
+    async def acquire(self, max_wait: float = 2.0) -> None:
+        """
+        Best-effort throttle: waits for a token up to ``max_wait`` seconds,
+        then gives up and lets the caller proceed unthrottled.
+
+        This must stay well under callers' own connect timeouts. Under a
+        heavy burst (hundreds of concurrent stream opens), a strict/unbounded
+        wait here can queue a read for many seconds, which can outlive the
+        stream's connect timeout and race the file handle being torn down
+        concurrently (surfaces as "Nursery is closed to new arrivals" and
+        crashes the whole FUSE loop, not just one read). Any 429/5xx that
+        slips through here is still handled by establish_connection's
+        retry-with-backoff.
+        """
+
+        with trio.move_on_after(max_wait):
+            async with self._lock:
+                while True:
+                    now = time.monotonic()
+                    self.tokens = min(
+                        self.capacity,
+                        self.tokens + (now - self.last_refill) * self.rate,
+                    )
+                    self.last_refill = now
+
+                    if self.tokens >= 1:
+                        self.tokens -= 1
+
+                        return
+
+                    await trio.sleep((1 - self.tokens) / self.rate)
+
+
+# TorBox's requestdl endpoint resolves a fresh CDN redirect on every call and
+# is not cached across reads/seeks, so every byte-range read on a torbox
+# stream hits it directly. TorBox enforces its own per-account rate limit on
+# this endpoint, so bursts of concurrent file opens (e.g. a media server
+# scanning a season) can trip its 429s. Throttle client-side to stay under it.
+_TORBOX_STREAM_RATE_LIMITER = _AsyncTokenBucket(rate=3.0, capacity=5)
 
 
 type ReadType = Literal[
@@ -570,7 +623,12 @@ class MediaStream:
                 struct.pack("ii", 1, 0),
             )
             if self.enable_tracing:
-                logger.log("STREAM", self.build_log_message("Applied SO_LINGER RST to connection socket"))
+                logger.log(
+                    "STREAM",
+                    self.build_log_message(
+                        "Applied SO_LINGER RST to connection socket"
+                    ),
+                )
         except Exception as e:
             logger.warning(self.build_log_message(f"Failed to apply SO_LINGER: {e}"))
 
@@ -823,6 +881,9 @@ class MediaStream:
 
         for attempt in range(max_attempts):
             try:
+                if self.provider == "torbox":
+                    await _TORBOX_STREAM_RATE_LIMITER.acquire()
+
                 async with self.async_client.stream(
                     method="GET",
                     url=self.target_url.value,
@@ -893,9 +954,15 @@ class MediaStream:
                                             struct.pack("ii", 1, 0),
                                         )
                                     _dup_fd = -1
-                                    logger.warning(self.build_log_message("Set SO_LINGER RST on socket"))
+                                    logger.warning(
+                                        self.build_log_message(
+                                            "Set SO_LINGER RST on socket"
+                                        )
+                                    )
                             except Exception as _e:
-                                logger.warning(self.build_log_message(f"Failed SO_LINGER: {_e}"))
+                                logger.warning(
+                                    self.build_log_message(f"Failed SO_LINGER: {_e}")
+                                )
                         if _dup_fd >= 0:
                             try:
                                 os.close(_dup_fd)
@@ -924,8 +991,15 @@ class MediaStream:
                         continue
 
                     raise DebridServiceForbiddenException(provider=self.provider) from e
-                elif status_code in (HTTPStatus.NOT_FOUND, HTTPStatus.GONE, HTTPStatus.SERVICE_UNAVAILABLE):
-                    # File can't be found at this URL; try refreshing the URL once
+                elif status_code in (
+                    HTTPStatus.BAD_REQUEST,
+                    HTTPStatus.NOT_FOUND,
+                    HTTPStatus.GONE,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                ):
+                    # File can't be found at this URL (TorBox returns 400 "Invalid
+                    # Presigned Token" for an expired dld link); try refreshing once
+
                     if attempt == 0:
                         has_fresh_url = await self._refresh_download_url()
 
@@ -968,6 +1042,38 @@ class MediaStream:
 
                     raise DebridServiceRateLimitedException(
                         provider=self.provider
+                    ) from e
+                elif 500 <= status_code < 600:
+                    # Transient upstream/server error - back off and retry
+                    logger.warning(
+                        self.build_log_message(
+                            f"HTTP {status_code} server error - attempt {attempt + 1}"
+                        )
+                    )
+
+                    if attempt == 0:
+                        # The CDN edge node serving this URL may be degraded;
+                        # try refreshing in case the provider hands out a
+                        # different node on re-unrestrict.
+                        has_fresh_url = await self._refresh_download_url()
+
+                        if has_fresh_url:
+                            logger.warning(
+                                self.build_log_message(
+                                    f"URL refresh after HTTP {status_code}"
+                                )
+                            )
+
+                    if await self._retry_with_backoff(
+                        attempt,
+                        max_attempts,
+                        backoffs,
+                    ):
+                        continue
+
+                    raise DebridServiceException(
+                        f"Persistent HTTP {status_code} error connecting to stream",
+                        provider=self.provider,
                     ) from e
                 else:
                     # Other unexpected status codes
@@ -1225,10 +1331,19 @@ class MediaStream:
 
         from program.services.filesystem.vfs import VFSDatabase
 
-        # Query database by original_filename and force unrestrict
-        entry_info = di[VFSDatabase].get_entry_by_original_filename(
-            original_filename=self.file_metadata.original_filename,
-            force_resolve=True,
+        # Query database by original_filename and force unrestrict.
+        #
+        # get_entry_by_original_filename with force_resolve=True does blocking work
+        # (synchronous SQLAlchemy + a provider unrestrict over SmartSession, which
+        # sleeps for rate limiting/retries). This coroutine has no other checkpoint,
+        # so calling it directly would freeze the whole FUSE/trio event loop for the
+        # duration, stalling every other read. Run it in a worker thread so the loop
+        # stays responsive (mirrors rivenvfs.get_entry_by_original_filename usage).
+        entry_info = await trio.to_thread.run_sync(
+            lambda: di[VFSDatabase].get_entry_by_original_filename(
+                original_filename=self.file_metadata.original_filename,
+                force_resolve=True,
+            )
         )
 
         if entry_info:
