@@ -731,7 +731,9 @@ class TorBoxDownloader(DownloaderBase):
         assert self.api
 
         try:
-            response = self.api.session.get(link, allow_redirects=False, stream=True)
+            response = self.api.session.get(
+                link, allow_redirects=False, stream=True, timeout=30
+            )
 
             try:
                 if response.status_code in (301, 302, 303, 307, 308):
